@@ -2,3 +2,6 @@
 *.o
 *.dSYM
 *.d
+*.mp4
+training/.DS_Store
+training/img/*.png
