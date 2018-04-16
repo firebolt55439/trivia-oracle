@@ -1,6 +1,6 @@
 CXX=clang++
-CXXFLAGS=-c -std=c++14 -g -O2 -Wall -Wno-unused-function -Wshadow -fno-rtti
-LDFLAGS=-stdlib=libc++ -lpthread -g
+CXXFLAGS=-c -std=c++14 -g -O2 -Wall -Wno-unused-function -Wshadow -fno-rtti `pkg-config --cflags tesseract`
+LDFLAGS=-stdlib=libc++ -lpthread -g `pkg-config --libs tesseract` -llept
 SOURCES=$(wildcard src/*.cpp)
 OBJECTS=$(addprefix obj/,$(notdir $(SOURCES:.cpp=.o)))
 EXECUTABLE=bin/trivia_oracle
