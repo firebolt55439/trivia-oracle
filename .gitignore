@@ -5,3 +5,7 @@
 *.mp4
 training/.DS_Store
 training/img/*.png
+a.json
+tmp.png
+trivia_oracle
+trivia_oracle
