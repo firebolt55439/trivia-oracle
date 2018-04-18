@@ -13,6 +13,10 @@
 #include <map>
 #include <thread>
 #include <mutex>
+#include "json.hpp"
+
+using json = nlohmann::json;
+bool debug = false;
 
 const char* SETTINGS_FILENAME = "./settings.txt";
 
@@ -89,15 +93,85 @@ std::string toLowerCase(std::string s){
     return s;
 }
 
+unsigned int countOccurrences(std::string in, std::string of){
+    size_t last = 0, next = 0;
+    unsigned int num = 0;
+    while((next = in.find(of, last)) != std::string::npos){
+        ++num;
+        last = next + 1;
+    }
+    return num;
+}
+
+std::string filterWords(std::string question){
+    // Break apart question into component words.
+    std::vector<std::string> questionWords;
+    std::string questionSearchPhrase = question;
+    size_t last = 0, next = 0;
+    while((next = questionSearchPhrase.find(" ", last)) != std::string::npos){
+        questionWords.push_back(stripString(questionSearchPhrase.substr(last, next-last)));
+        last = next + 1;
+    }
+    questionWords.push_back(stripString(questionSearchPhrase.substr(last)));
+
+    // Filter words accordingly.
+    size_t curPos = 0;
+    bool are_quoted = false;
+    for(auto& removingWord : settings.filtered_words){
+        for(auto it = questionWords.rbegin(); it != questionWords.rend(); it++){
+            unsigned int numQuotes = countOccurrences(*it, "\"");
+            if(numQuotes % 2 != 0) are_quoted = !are_quoted;
+            if(are_quoted) continue; // don't mess with a quote
+            if(toLowerCase(*it) == removingWord) it->erase();
+            else if(!isalnum(removingWord[0]) && removingWord.length() == 1){
+                if((curPos = (*it).find(removingWord)) != std::string::npos){
+                    (*it).erase(curPos, 1);
+                }
+            }
+        }
+    }
+
+    // Recombine words to produce appropriate search phrase.
+    questionSearchPhrase = "";
+    for(auto& s : questionWords){
+        if(stripString(s).length() == 0) continue;
+        questionSearchPhrase += s + " ";
+    }
+    questionSearchPhrase = stripString(questionSearchPhrase);
+    return questionSearchPhrase;
+}
+
 size_t write_data(void *ptr, size_t size, size_t nmemb, void *stream){
     std::string data((const char*)ptr, (size_t)(size * nmemb));
     *((std::stringstream*) stream) << data << std::endl;
     return size * nmemb;
 }
 
+std::string fixBrokenEncoding(std::string s){
+    // printf("checking |%s|\n", s.c_str());
+    std::string stripped = "";
+    for(unsigned int i = 0; i < s.length(); i++){
+        unsigned char on = s[i];
+        if((i + 2) > s.length()){
+            stripped.push_back(on);
+            continue;
+        }
+        unsigned char on2 = s[i + 1], on3 = s[i + 2];
+        if(on == '%' && on2 == '2' && on3 == '0'){
+            stripped.push_back('+');
+            i += 2;
+        } else stripped.push_back(on);
+        // printf("%u (%c)|", (unsigned int)on, on);
+    }
+    // printf("\n");
+    return stripped;
+}
+
 std::string downloadSearch(std::string term){
     void* curl = curl_easy_init();
-    std::string url = "http://cors-fanfic-proxy.herokuapp.com/https://google.com/search?q=" + std::string(curl_easy_escape(curl, term.c_str(), 0));
+    std::string escaped_term = fixBrokenEncoding(std::string(curl_easy_escape(curl, term.c_str(), 0)));
+    std::string url = "https://www.googleapis.com/customsearch/v1element?key=AIzaSyCVAXiUzRYsML1Pv6RwSG1gunmMikTzQqY&rsz=filtered_cse&num=10&hl=en&prettyPrint=false&source=gcsc&gss=.com&sig=e1802cf5e026ddfc00efb195494e1737&cx=008168216620912078883:quclw-hgjgi&q=" + escaped_term + "&cse_tok=ABPF6Hg34ZX4-6D_NX2RAdXw9NzUcQnD6g:1524072745827&sort=&googlehost=www.google.com&oq=" + escaped_term + "&gs_l=partner-generic.12...20843.21484.1.25604.7.6.0.0.0.0.1573.4069.1j1j1j6-1j1j1.6.0.gsnos%2Cn%3D13...0.21594j230180020j13j1..1ac.1.25.partner-generic..11.0.0.wokf0Swii4s&callback=google.search.Search.apiary3924&nocache=1524072780577";
+    // std::string url = "http://cors-fanfic-proxy.herokuapp.com/https://google.com/search?q=" + std::string(curl_easy_escape(curl, term.c_str(), 0));
     std::stringstream out;
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
@@ -122,56 +196,24 @@ std::string downloadSearch(std::string term){
     return out.str();
 }
 
-std::string filterWords(std::string question){
-    // Break apart question into component words.
-    std::vector<std::string> questionWords;
-    std::string questionSearchPhrase = question;
-    size_t last = 0, next = 0;
-    while((next = questionSearchPhrase.find(" ", last)) != std::string::npos){
-        questionWords.push_back(stripString(questionSearchPhrase.substr(last, next-last)));
-        last = next + 1;
-    }
-    questionWords.push_back(stripString(questionSearchPhrase.substr(last)));
-
-    // Filter words accordingly.
-    size_t curPos = 0;
-    for(auto& removingWord : settings.filtered_words){
-        for(auto it = questionWords.rbegin(); it != questionWords.rend(); it++){
-            if(toLowerCase(*it) == removingWord) it->erase();
-            else if(!isalnum(removingWord[0]) && removingWord.length() == 1){
-                if((curPos = (*it).find(removingWord)) != std::string::npos){
-                    (*it).erase(curPos, 1);
-                }
-            }
-        }
-    }
-
-    // Recombine words to produce appropriate search phrase.
-    questionSearchPhrase = "";
-    for(auto& s : questionWords){
-        if(stripString(s).length() == 0) continue;
-        questionSearchPhrase += s + " ";
-    }
-    questionSearchPhrase = stripString(questionSearchPhrase);
-    return questionSearchPhrase;
-}
-
-unsigned int countOccurrences(std::string in, std::string of){
-    size_t last = 0, next = 0;
-    unsigned int num = 0;
-    while((next = in.find(of, last)) != std::string::npos){
-        ++num;
-        last = next + 1;
-    }
-    return num;
+std::string getBetween(std::string s, std::string a, std::string b){
+    size_t pos = s.find(a);
+    if(pos == std::string::npos) return "";
+    s = s.substr(pos + a.length());
+    pos = s.find(b);
+    if(pos == std::string::npos) return "";
+    return s.substr(0, pos);
 }
 
 unsigned int predictQuestionAnswer(Question q){
     // Filter words.
+    const std::string origQuestion = q.question;
     std::string questionSearchPhrase = filterWords(q.question);
+    /*
     for(unsigned int i = 0; i < q.options.size(); i++){
         q.options[i] = filterWords(q.options[i]);
     }
+    */
     printf("Query search phrase: %s\n", questionSearchPhrase.c_str());
 
     // Check for negative words.
@@ -187,56 +229,94 @@ unsigned int predictQuestionAnswer(Question q){
     }
 
     // Define search string generator functions.
-    std::string (*searchStringFn [])(std::string, std::string) = {
-        [](std::string s, std::string opt){
+    std::string (*searchStringFn [])(std::string, std::string, std::string) = {
+        [](std::string s, std::string os, std::string opt){
             return s;
         },
+        [](std::string s, std::string os, std::string opt){
+            return os;
+        }
+        /*,
         [](std::string s, std::string opt){
             return "\"" + s + "\" AND \"" + opt + "\"";
-        }
+        }*/
     };
 
     // Define search string result processing functions.
-    double (*searchProcessFn [])(std::string, std::string) = {
-        [](std::string res, std::string opt){
-            // Number of substring occurrences.
-            size_t last = 0, next = 0;
-            res = toLowerCase(res);
-            opt = toLowerCase(opt);
-            double score = 0.0;
-            while((next = res.find(opt, last)) != std::string::npos){
-                ++score;
-                last = next + 1;
+    auto countSubstringResultOccurrences = [](json res, std::string opt_orig){
+        // Number of substring occurrences.
+        // Take higher score: either filtered or non-filtered option
+        double score = 0.0;
+        size_t last = 0, next = 0;
+        for(unsigned int i = 0; i < 2; i++){
+            std::string opt = toLowerCase(opt_orig);
+            if(i == 1){
+                opt = filterWords(opt);
+                if(opt.length() < 1) continue;
             }
-            return score;
-        },
-        [](std::string res, std::string opt){
-            // Number of search results.
-            size_t pos;
-            const std::string delim = "id=\"resultStats\">About ";
-            if((pos = res.find(delim)) == std::string::npos) return 0.0;
-            res = res.substr(pos + delim.length());
-            res = res.substr(0, res.find(" "));
-            res.erase(std::remove_if(res.begin(), res.end(), [](char c){
-                return c == ',';
-            }), res.end());
-            double ret = atof(res.c_str());
-            //printf("for |%s|, |%f| results\n", opt.c_str(), ret);
-            return ret;
+            double our_score = 0.0;
+            for(auto& on : res["results"]){
+                std::string infoString = on["titleNoFormatting"].get<std::string>() + " ";
+                infoString += on["contentNoFormatting"].get<std::string>();
+                infoString = toLowerCase(infoString);
+                while((next = infoString.find(opt, last)) != std::string::npos){
+                    ++our_score;
+                    last = next + 1;
+                }
+            }
+            if(our_score > score) score = our_score;
         }
+        return score;
+        /*
+        size_t last = 0, next = 0;
+        res = toLowerCase(res);
+        opt = toLowerCase(opt);
+        double score = 0.0;
+        while((next = res.find(opt, last)) != std::string::npos){
+            ++score;
+            last = next + 1;
+        }
+        return score;
+        */
+    };
+    double (*searchProcessFn [])(json, std::string) = {
+        countSubstringResultOccurrences,
+        countSubstringResultOccurrences
+        /*,
+        [](json res, std::string opt){
+            // Number of search results.
+            double ret = atof(res["cursor"]["estimatedResultCount"].get<std::string>().c_str());
+            return ret;
+        }*/
     };
 
     // Search for each generated string per option in parallel.
     std::mutex downloadMutex;
-    std::vector<std::tuple<std::string, std::string, unsigned int> > searchTerms;
+    std::vector<std::tuple<json, std::string, unsigned int> > searchTerms;
     std::vector<std::thread> workers;
     for(auto opt : q.options){
         for(unsigned int i = 0; i < sizeof(searchStringFn) / sizeof(char*); i++){
-            std::string term = (searchStringFn[i])(questionSearchPhrase, opt);
+            std::string term = (searchStringFn[i])(questionSearchPhrase, origQuestion, opt);
             workers.push_back(std::thread([term, i, &searchTerms, opt, &downloadMutex](){
                 std::string res = downloadSearch(term);
+                res = getBetween(res, "google.search.Search.apiary3924(", ");");
+                res.erase(std::remove_if(res.begin(), res.end(), [](char c){
+                    return c == '\n';
+                }), res.end());
+                //std::cout << "|" << res << "|\n";
+                json j;
+                try {
+                    j = json::parse(res);
+                } catch(nlohmann::detail::parse_error){
+                    std::cout << "Could not parse:\n";
+                    std::cout << res << std::endl;
+                    ::exit(1);
+                    return;
+                }
+                if(debug) std::cout << j.dump() << std::endl;
+                // ::exit(1);
                 std::lock_guard<std::mutex> lk(downloadMutex);
-                searchTerms.emplace_back(res, opt, i);
+                searchTerms.emplace_back(j, opt, i);
                 printf("Option: '%s' | method: #%u | search term: '%s'\n", opt.c_str(), i + 1, term.c_str());
             }));
         }
@@ -328,9 +408,11 @@ int recognizeQuestionFromImage(std::string filename, Question* q){
             TextBoundingBox tbb;
 
             // Save recognized text.
-            std::string line = stripString(ri->GetUTF8Text(level));
+            const char* origText = ri->GetUTF8Text(level);
+            std::string line = stripString(origText);
+            delete[] origText;
             tbb.line = line;
-            if(line.find("left to reveal") != std::string::npos) continue;
+            if(line.find("reveal comments") != std::string::npos) continue;
 
             // Save confidence.
             float conf = ri->Confidence(level);
@@ -438,6 +520,12 @@ int main(int argc, char** argv){
         // TODO: Proper argparse
         fprintf(stderr, "No filename provided.\n");
         return 1;
+    }
+
+    // Check for flags.
+    for(unsigned int i = 2; i < argc; i++){
+        std::string on(argv[i]);
+        if(on == "--debug") debug = true;
     }
 
     // Initialize settings.
