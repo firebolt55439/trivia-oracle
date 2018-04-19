@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include <fstream>
+#include <streambuf>
 #include <algorithm>
 #include <tesseract/baseapi.h>
 #include <leptonica/allheaders.h>
@@ -13,12 +14,17 @@
 #include <map>
 #include <thread>
 #include <mutex>
+#include <unistd.h>
+#include <ncurses.h>
 #include "json.hpp"
+#include <ctime>
 
 using json = nlohmann::json;
 bool debug = false;
+int numRows, numCols;
 
-const char* SETTINGS_FILENAME = "./settings.txt";
+const std::string SETTINGS_FILENAME = "./settings.txt";
+const std::string CREDENTIALS_FILENAME = "./credentials.json";
 
 namespace Colors {
     const char* HEADER = "\033[95m";
@@ -34,6 +40,7 @@ namespace Colors {
 struct Settings {
     std::vector<std::string> filtered_words; // words to remove when searching
     std::vector<std::string> negative_words; // e.g. isn't, can't
+    std::string user_id, bearer_id;
 };
 
 Settings settings;
@@ -515,6 +522,45 @@ int recognizeQuestionFromImage(std::string filename, Question* q){
     return 0;
 }
 
+json retrieveShowStatus(){
+    void* curl = curl_easy_init();
+    std::string url = "https://api-quiz.hype.space/shows/now?type=hq&userId=" + settings.user_id;
+    std::stringstream out;
+
+    struct curl_slist *chunk = NULL;
+    chunk = curl_slist_append(chunk, "x-hq-stk: MQ==");
+    chunk = curl_slist_append(chunk, ("Authorization: Bearer" + settings.bearer_id).c_str());
+    chunk = curl_slist_append(chunk, "x-hq-client: Android/1.3.0");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "deflate");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &out);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "okhttp/3.8.0");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, chunk);
+
+    CURLcode res = curl_easy_perform(curl);
+    if(res != CURLE_OK){
+        std::cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res) << "\n";
+        return json::object();
+    }
+    curl_easy_cleanup(curl);
+    curl_slist_free_all(chunk);
+    return json::parse(out.str());
+}
+
+template<class... Args>
+void centerWriteText(int row, const char* fmt, Args&&... args){
+    int neededLen = snprintf(NULL, 0, fmt, std::forward<Args>(args)...);
+    char* buf = new char[neededLen + 1]; 
+    sprintf(buf, fmt, std::forward<Args>(args)...);
+    std::string formatted(buf);
+    delete[] buf;
+    mvprintw(row, numCols / 2 - formatted.length() / 2, formatted.c_str());
+}
+
 int main(int argc, char** argv){
     if(argc == 1){
         // TODO: Proper argparse
@@ -530,18 +576,25 @@ int main(int argc, char** argv){
 
     // Initialize settings.
     curl_global_init(CURL_GLOBAL_ALL);
-    std::ifstream ifp(SETTINGS_FILENAME);
+    std::ifstream settingsIfp(SETTINGS_FILENAME);
     std::string cur_line;
     std::vector<std::string>* settingsPointerArr[] = {
         &settings.filtered_words,
         &settings.negative_words
     };
     int settingsPosition = -1;
-    while(std::getline(ifp, cur_line)){
+    while(std::getline(settingsIfp, cur_line)){
         if(cur_line == "[filtered words]") settingsPosition = 0;
         else if(cur_line == "[negative words]") settingsPosition = 1;
         else if(cur_line.length() > 0) settingsPointerArr[settingsPosition]->push_back(cur_line);
     }
+
+    // Initialize credentials.
+    std::ifstream credsIfp(CREDENTIALS_FILENAME);
+    std::string credsJsonRaw((std::istreambuf_iterator<char>(credsIfp)), std::istreambuf_iterator<char>());
+    json credsJson = json::parse(credsJsonRaw);
+    settings.user_id = credsJson["user_id"].get<std::string>();
+    settings.bearer_id = credsJson["bearer_id"].get<std::string>();
 
     // Initialize tesseract-ocr with English, without specifying tessdata path
     std::cout << "Initializing tesseract library...";
@@ -552,10 +605,18 @@ int main(int argc, char** argv){
     }
     std::cout << " [OK]\n";
 
+    // Initialize and configure ncurses.
+    initscr(); // create a screen
+    getmaxyx(stdscr, numRows, numCols);
+    cbreak(); // disable line buffering but allow crtl-C-style keyboard interrupts
+    noecho(); // don't show getch() keys on screen
+    curs_set(0); // hide cursor
+
+    // Handle arguments and start main event loop.
     std::string mainArg(argv[1]);
-    if(mainArg == "--live"){
+    if(mainArg == "--live-ocr"){
         char c;
-        while((c = getchar() != EOF)){
+        while((c = getch() != EOF)){
             // Capture the screenshot.
             system("screencapture -R0,22,490,855 tmp.png");
 
@@ -569,6 +630,82 @@ int main(int argc, char** argv){
 
             // Predict question answer.
             predictQuestionAnswer(q);
+        }
+    } else if(mainArg == "--live"){
+        // TODO: Websocket using bearer ID + user ID creds
+        // TODO: ncurses interface
+        printw("Initialized %dx%d window.", numRows, numCols);
+        refresh();
+        start_color();
+        init_pair(1, COLOR_MAGENTA, COLOR_BLACK);
+        init_pair(2, COLOR_GREEN, COLOR_BLACK);
+        bool exiting = false;
+        WINDOW* main_win = NULL;
+        while(!exiting){
+            // Clear window.
+            if(main_win != NULL) delwin(main_win);
+            main_win = newwin(numRows, numCols, 0, 0);
+            wrefresh(main_win);
+
+            // Display refresh time on top-right.
+            std::stringstream timess;
+            auto curTime = std::time(nullptr);
+            auto tm = *std::localtime(&curTime);
+            timess << std::put_time(&tm, "Last refreshed %b %m, %G at %I:%M:%S %p");
+            mvprintw(0, numCols - timess.str().length(), timess.str().c_str());
+
+            // Retrieve status anew.
+            json j = retrieveShowStatus();
+            // std::cout << j.dump() << std::endl;
+            // TODO: A_STANDOUT suggested answer
+
+            // Check if show is live.
+            if(j["active"].get<bool>() == false){
+                // Parse next show datetime.
+                int y,M,d,h,m;
+                float s;
+                sscanf(j["nextShowTime"].get<std::string>().c_str(), "%d-%d-%dT%d:%d:%fZ", &y, &M, &d, &h, &m, &s);
+
+                // Display status header.
+                attron(A_UNDERLINE);
+                attron(COLOR_PAIR(1));
+                centerWriteText(numRows / 4, "Show is not currently live.");
+                attroff(A_UNDERLINE);
+                attroff(COLOR_PAIR(1));
+
+                // Display next show time.
+                attron(A_BOLD);
+                attron(COLOR_PAIR(2));
+                centerWriteText(numRows / 2, "The next show is on %d/%d/%d at %02d:%02d:%02d.", M, d, y, h, m, round(s));
+                attroff(A_BOLD);
+                attroff(COLOR_PAIR(2));
+
+                // Display raw JSON ouput.
+                const std::string jStr = j.dump();
+                int numColsNeeded = jStr.length() / numCols;
+                if(jStr.length() % numCols != 0) ++numColsNeeded;
+                mvprintw(numRows - numColsNeeded, 0, jStr.c_str());
+            } else {
+                attron(A_UNDERLINE);
+                centerWriteText(numRows / 4, "Show is not currently live.");
+                attroff(A_UNDERLINE);
+                attron(A_BOLD);
+                // centerWriteText(numRows / 2, "The next show is on %d/%d/%d at %02d:%02d:%02d.", M, d, y, h, m, round(s));
+                attroff(A_BOLD);
+            }
+
+            // Draw changes on screen.
+            refresh();
+
+            // Handle character commands.
+            char ch;
+            while((ch = getch()) != EOF){
+                if(ch == 'q') exiting = true;
+                else if(ch == 'r') mvprintw(0, 0, "Refreshing...");
+                else continue;
+                refresh();
+                break;
+            }
         }
     } else {
         // Recognize question from provided filename.
@@ -584,6 +721,7 @@ int main(int argc, char** argv){
     }
 
     // Release memory.
+    endwin();
     api->End();
     return 0;
 }
