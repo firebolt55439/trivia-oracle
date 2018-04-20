@@ -18,8 +18,13 @@
 #include <ncurses.h>
 #include "json.hpp"
 #include <ctime>
+#include <locale.h>
+#include <cpprest/ws_client.h>
 
 using json = nlohmann::json;
+using namespace web;
+using namespace web::websockets::client;
+
 bool debug = false;
 int numRows, numCols;
 
@@ -212,7 +217,7 @@ std::string getBetween(std::string s, std::string a, std::string b){
     return s.substr(0, pos);
 }
 
-unsigned int predictQuestionAnswer(Question q){
+unsigned int predictQuestionAnswer(Question& q, bool verbose = true){
     // Filter words.
     const std::string origQuestion = q.question;
     std::string questionSearchPhrase = filterWords(q.question);
@@ -221,7 +226,7 @@ unsigned int predictQuestionAnswer(Question q){
         q.options[i] = filterWords(q.options[i]);
     }
     */
-    printf("Query search phrase: %s\n", questionSearchPhrase.c_str());
+    if(verbose) printf("Query search phrase: %s\n", questionSearchPhrase.c_str());
 
     // Check for negative words.
     bool negative = false;
@@ -304,7 +309,7 @@ unsigned int predictQuestionAnswer(Question q){
     for(auto opt : q.options){
         for(unsigned int i = 0; i < sizeof(searchStringFn) / sizeof(char*); i++){
             std::string term = (searchStringFn[i])(questionSearchPhrase, origQuestion, opt);
-            workers.push_back(std::thread([term, i, &searchTerms, opt, &downloadMutex](){
+            workers.push_back(std::thread([term, i, &searchTerms, opt, &downloadMutex, &verbose](){
                 std::string res = downloadSearch(term);
                 res = getBetween(res, "google.search.Search.apiary3924(", ");");
                 res.erase(std::remove_if(res.begin(), res.end(), [](char c){
@@ -324,7 +329,7 @@ unsigned int predictQuestionAnswer(Question q){
                 // ::exit(1);
                 std::lock_guard<std::mutex> lk(downloadMutex);
                 searchTerms.emplace_back(j, opt, i);
-                printf("Option: '%s' | method: #%u | search term: '%s'\n", opt.c_str(), i + 1, term.c_str());
+                if(verbose) printf("Option: '%s' | method: #%u | search term: '%s'\n", opt.c_str(), i + 1, term.c_str());
             }));
         }
     }
@@ -377,7 +382,7 @@ unsigned int predictQuestionAnswer(Question q){
     }
 
     // Display result.
-    std::cout << std::endl << q;
+    if(verbose) std::cout << std::endl << q;
 
     // Return result.
     return highestInd;
@@ -529,7 +534,7 @@ json retrieveShowStatus(){
 
     struct curl_slist *chunk = NULL;
     chunk = curl_slist_append(chunk, "x-hq-stk: MQ==");
-    chunk = curl_slist_append(chunk, ("Authorization: Bearer" + settings.bearer_id).c_str());
+    chunk = curl_slist_append(chunk, ("Authorization: Bearer " + settings.bearer_id).c_str());
     chunk = curl_slist_append(chunk, "x-hq-client: Android/1.3.0");
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
@@ -561,6 +566,81 @@ void centerWriteText(int row, const char* fmt, Args&&... args){
     mvprintw(row, numCols / 2 - formatted.length() / 2, formatted.c_str());
 }
 
+template<class... Args>
+void rightWriteText(int row, const char* fmt, Args&&... args){
+    int neededLen = snprintf(NULL, 0, fmt, std::forward<Args>(args)...);
+    char* buf = new char[neededLen + 1]; 
+    sprintf(buf, fmt, std::forward<Args>(args)...);
+    std::string formatted(buf);
+    delete[] buf;
+    mvprintw(row, numCols - formatted.length(), formatted.c_str());
+}
+
+void displayAndSolveQuestion(json j){
+    const std::string type = j["type"].get<std::string>();
+    if(type == "question"){
+        // Parse question from JSON object
+        Question q;
+        q.question = j["question"].get<std::string>();
+        for(auto& obj : j["answers"]){
+            q.options.push_back(obj["text"].get<std::string>());
+        }
+
+        // Display parsed question
+        move(numRows / 2, 0);
+        refresh();
+        std::cout << q;
+
+        // Predict question answer
+        unsigned int idx = predictQuestionAnswer(q, /*verbose=*/false);
+
+        // Display question answer
+        move(numRows - 1, 0);
+        for(int i = 0; i < numRows; i++){
+            puts(""); // TODO: better way to clear just affected area (subwindow?)
+        }
+        std::cout << q;
+        refresh();
+    } else if(type == "questionSummary"){
+        // ...
+    }
+}
+
+std::string parseDate(std::string iso8601){
+    // From https://stackoverflow.com/questions/26895428/how-do-i-parse-an-iso-8601-date-with-optional-milliseconds-to-a-struct-tm-in-c/26896792#comment42344300_26895428
+    // Parse ISO 8601
+    int y,M,d,h,m;
+    float s;
+    int tzh = 0, tzm = 0;
+    if (6 < sscanf(iso8601.c_str(), "%d-%d-%dT%d:%d:%f%d:%dZ", &y, &M, &d, &h, &m, &s, &tzh, &tzm)){
+        if (tzh < 0) {
+           tzm = -tzm; // Fix the sign on minutes.
+        }
+    }
+
+    // Fill time structure based on parsed values
+    time_t curTime;
+    time(&curTime);
+    long long int tzDiff = difftime(mktime(localtime(&curTime)), mktime(gmtime(&curTime)));
+    struct tm time;
+    time.tm_year = y - 1900; // Year since 1900
+    time.tm_mon = M - 1; // 0-11
+    time.tm_mday = d; // 1-31
+    time.tm_hour = h; // 0-23
+    time.tm_min = m; // 0-59
+    time.tm_sec = (int)s; // 0-61 (0-60 in C++11)
+
+    // Compensate for time zone difference
+    // printf("%lu + %lld = %lu", mktime(&time), tzDiff, mktime(&time) + static_cast<time_t>(tzDiff));
+    time_t offsetedTimeStamp = mktime(&time) + tzDiff;
+    struct tm* our_time = localtime(&offsetedTimeStamp);
+
+    // Format and return
+    std::stringstream ss;
+    ss << std::put_time(our_time, "%b %e, %G at %I:%M:%S %p");
+    return ss.str();
+}
+
 int main(int argc, char** argv){
     if(argc == 1){
         // TODO: Proper argparse
@@ -575,6 +655,7 @@ int main(int argc, char** argv){
     }
 
     // Initialize settings.
+    setlocale(LC_NUMERIC, "");
     curl_global_init(CURL_GLOBAL_ALL);
     std::ifstream settingsIfp(SETTINGS_FILENAME);
     std::string cur_line;
@@ -639,8 +720,12 @@ int main(int argc, char** argv){
         start_color();
         init_pair(1, COLOR_MAGENTA, COLOR_BLACK);
         init_pair(2, COLOR_GREEN, COLOR_BLACK);
+        init_pair(3, COLOR_CYAN, COLOR_BLACK);
+        init_pair(4, COLOR_BLACK, COLOR_RED);
+        init_pair(5, COLOR_BLACK, COLOR_GREEN);
         bool exiting = false;
         WINDOW* main_win = NULL;
+        std::vector<std::thread> wsThreads;
         while(!exiting){
             // Clear window.
             if(main_win != NULL) delwin(main_win);
@@ -651,7 +736,7 @@ int main(int argc, char** argv){
             std::stringstream timess;
             auto curTime = std::time(nullptr);
             auto tm = *std::localtime(&curTime);
-            timess << std::put_time(&tm, "Last refreshed %b %m, %G at %I:%M:%S %p");
+            timess << std::put_time(&tm, "Last refreshed %b %e, %G at %I:%M:%S %p");
             mvprintw(0, numCols - timess.str().length(), timess.str().c_str());
 
             // Retrieve status anew.
@@ -661,11 +746,6 @@ int main(int argc, char** argv){
 
             // Check if show is live.
             if(j["active"].get<bool>() == false){
-                // Parse next show datetime.
-                int y,M,d,h,m;
-                float s;
-                sscanf(j["nextShowTime"].get<std::string>().c_str(), "%d-%d-%dT%d:%d:%fZ", &y, &M, &d, &h, &m, &s);
-
                 // Display status header.
                 attron(A_UNDERLINE);
                 attron(COLOR_PAIR(1));
@@ -676,7 +756,7 @@ int main(int argc, char** argv){
                 // Display next show time.
                 attron(A_BOLD);
                 attron(COLOR_PAIR(2));
-                centerWriteText(numRows / 2, "The next show is on %d/%d/%d at %02d:%02d:%02d.", M, d, y, h, m, round(s));
+                centerWriteText(numRows / 2, "The next show is on %s.", parseDate(j["nextShowTime"].get<std::string>()).c_str());
                 attroff(A_BOLD);
                 attroff(COLOR_PAIR(2));
 
@@ -686,12 +766,107 @@ int main(int argc, char** argv){
                 if(jStr.length() % numCols != 0) ++numColsNeeded;
                 mvprintw(numRows - numColsNeeded, 0, jStr.c_str());
             } else {
+                // Parse show starting datetime.
+                int y,M,d,h,m;
+                float s;
+                sscanf(j["startTime"].get<std::string>().c_str(), "%d-%d-%dT%d:%d:%fZ", &y, &M, &d, &h, &m, &s);
+
+                // Display status header.
                 attron(A_UNDERLINE);
-                centerWriteText(numRows / 4, "Show is not currently live.");
+                attron(COLOR_PAIR(1));
+                centerWriteText(numRows / 4, "Show is currently live!");
                 attroff(A_UNDERLINE);
+                attroff(COLOR_PAIR(1));
+
+                // Display prize.
                 attron(A_BOLD);
-                // centerWriteText(numRows / 2, "The next show is on %d/%d/%d at %02d:%02d:%02d.", M, d, y, h, m, round(s));
+                attron(COLOR_PAIR(3));
+                centerWriteText(numRows / 4 + 2, "The prize is $%'d.", j["prize"].get<int>());
                 attroff(A_BOLD);
+                attroff(COLOR_PAIR(3));
+
+                // Display video stream URL.
+                centerWriteText(numRows / 4 + 4, "Broadcast can be streamed at %s.", j["broadcast"]["streamUrl"].get<std::string>().c_str());
+
+                // Display show start time.
+                mvprintw(0, 0, "Show started on %d/%d/%d at %02d:%02d:%02d", M, d, y, h, m, round(s));
+
+                // Handle websocket in background thread.
+                std::string socketUrl = j["broadcast"]["socketUrl"].get<std::string>();
+                socketUrl = "ws" + socketUrl.substr(socketUrl.find("http") + 4); // replace "http" with "ws"
+                websocket_client_config client_config;
+                auto& headers = client_config.headers();
+                headers.add("x-hq-stk", "MQ==");
+                headers.add("Authorization", "Bearer " + settings.bearer_id);
+                headers.add("x-hq-client", "Android/1.3.0");
+                websocket_client client(client_config);
+                try {
+                    client.connect(socketUrl).wait();
+
+                    // Display success.
+                    attron(COLOR_PAIR(5));
+                    centerWriteText(2, "Successfully connected to websocket at %s.", socketUrl.c_str());
+                    attroff(COLOR_PAIR(5));
+
+                    // Start thread.
+                    wsThreads.push_back(std::thread([&client](){
+                        try {
+                            while(true){
+                                client.receive().then([](websocket_incoming_message msg){
+                                    return msg.extract_string();
+                                }).then([&client](std::string msg){
+                                    // Attempt to parse message.
+                                    json parsed;
+                                    try {
+                                        parsed = json::parse(msg);
+                                    } catch(nlohmann::detail::parse_error){
+                                        attron(COLOR_PAIR(4));
+                                        mvprintw(6, 0, "Could not parse: |%s|", msg.c_str());
+                                        attroff(COLOR_PAIR(4));
+                                        refresh();
+                                        return;
+                                    }
+
+                                    // Handle message.
+                                    const std::string type = parsed["type"].get<std::string>();
+                                    if(type == "question"){
+                                        displayAndSolveQuestion(parsed);
+                                    } else if(type == "questionClosed"){
+                                        attron(COLOR_PAIR(2));
+                                        rightWriteText(1, "Question closed.");
+                                        attroff(COLOR_PAIR(2));
+                                    } else if(type == "questionSummary"){
+                                        displayAndSolveQuestion(parsed);
+                                    } else if(type == "questionFinished"){
+                                        attron(COLOR_PAIR(2));
+                                        rightWriteText(1, "Question finished.");
+                                        attroff(COLOR_PAIR(2));
+                                    } else if(type == "broadcastStats"){
+                                        rightWriteText(2, "Player Count: %s", parsed["viewerCounts"]["playing"].get<std::string>().c_str());
+                                        rightWriteText(3, "Spectator Count: %s", parsed["viewerCounts"]["watching"].get<std::string>().c_str());
+                                    } else if(type == "broadcastEnded"){
+                                        attron(COLOR_PAIR(4));
+                                        attron(A_BLINK);
+                                        rightWriteText(0, "Broadcast has ended.");
+                                        attroff(A_BLINK);
+                                        attroff(COLOR_PAIR(4));
+                                        client.close();
+                                    }
+                                    refresh();
+                                }).wait();
+                            }
+                        } catch(std::exception& e){
+                            attron(COLOR_PAIR(4));
+                            mvprintw(6, 0, "Caught exception: |%s|", e.what());
+                            attroff(COLOR_PAIR(4));
+                            refresh();
+                        }
+                    }));
+                } catch(std::exception& e){
+                    attron(COLOR_PAIR(4));
+                    centerWriteText(2, "Could not connect to websocket at %s (%s).", socketUrl.c_str(), e.what());
+                    attroff(COLOR_PAIR(4));
+                }
             }
 
             // Draw changes on screen.
@@ -718,6 +893,9 @@ int main(int argc, char** argv){
 
         // Predict question answer.
         predictQuestionAnswer(q);
+
+        // Wait for keypress.
+        getchar();
     }
 
     // Release memory.
