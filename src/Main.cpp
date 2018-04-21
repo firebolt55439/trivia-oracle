@@ -856,9 +856,26 @@ int main(int argc, char** argv){
                                 }).wait();
                             }
                         } catch(std::exception& e){
-                            attron(COLOR_PAIR(4));
-                            mvprintw(6, 0, "Caught exception: |%s|", e.what());
-                            attroff(COLOR_PAIR(4));
+                            bool display_error = true;
+                            std::string err_msg(e.what());
+                            if(err_msg.find("close") !== std::string::npos){
+                                try {
+                                    display_error = false;
+                                    client.connect(socketUrl).wait();
+                                } catch(std::exception& e){
+                                    err_msg = std::string(e.what());
+                                    display_error = true;
+                                }
+                            }
+                            if(display_error){
+                                attron(COLOR_PAIR(4));
+                                mvprintw(6, 0, "Caught exception: |%s|", err_msg.c_str());
+                                attroff(COLOR_PAIR(4));
+                            } else {
+                                attron(COLOR_PAIR(5));
+                                mvprintw(7, 0, "Successfully reconnected");
+                                attroff(COLOR_PAIR(5));
+                            }
                             refresh();
                         }
                     }));
