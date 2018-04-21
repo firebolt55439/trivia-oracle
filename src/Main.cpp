@@ -592,7 +592,7 @@ void displayAndSolveQuestion(json j){
         std::cout << q;
 
         // Predict question answer
-        unsigned int idx = predictQuestionAnswer(q, /*verbose=*/false);
+        predictQuestionAnswer(q, /*verbose=*/false);
 
         // Display question answer
         move(numRows - 1, 0);
@@ -673,14 +673,20 @@ int main(int argc, char** argv){
     // Initialize credentials.
     std::ifstream credsIfp(CREDENTIALS_FILENAME);
     std::string credsJsonRaw((std::istreambuf_iterator<char>(credsIfp)), std::istreambuf_iterator<char>());
-    json credsJson = json::parse(credsJsonRaw);
-    settings.user_id = credsJson["user_id"].get<std::string>();
-    settings.bearer_id = credsJson["bearer_id"].get<std::string>();
+    json credsJson;
+    try {
+        credsJson = json::parse(credsJsonRaw);
+        settings.user_id = credsJson["user_id"].get<std::string>();
+        settings.bearer_id = credsJson["bearer_id"].get<std::string>();
+        printf("Initialized with bearer ID '%s' and user ID '%s'.\n", settings.bearer_id.c_str(), settings.user_id.c_str());
+    } catch(nlohmann::detail::parse_error){
+        std::cout << "No credentials provided — live mode will not work." << std::endl;
+    }
 
     // Initialize tesseract-ocr with English, without specifying tessdata path
     std::cout << "Initializing tesseract library...";
     api = new tesseract::TessBaseAPI();
-    if (api->Init(NULL, "eng")) {
+    if(api->Init(NULL, "eng")) {
         fprintf(stderr, "Could not initialize tesseract.\n");
         return 1;
     }
@@ -713,8 +719,12 @@ int main(int argc, char** argv){
             predictQuestionAnswer(q);
         }
     } else if(mainArg == "--live"){
-        // TODO: Websocket using bearer ID + user ID creds
-        // TODO: ncurses interface
+        if(settings.user_id.empty() || settings.bearer_id.empty()){
+            std::cerr << "Cannot use live mode if credentials are not provided." << std::endl;
+            endwin();
+            api->End();
+            return 1;
+        }
         printw("Initialized %dx%d window.", numRows, numCols);
         refresh();
         start_color();
@@ -796,7 +806,6 @@ int main(int argc, char** argv){
                 socketUrl = "ws" + socketUrl.substr(socketUrl.find("http") + 4); // replace "http" with "ws"
                 websocket_client_config client_config;
                 auto& headers = client_config.headers();
-                headers.add("x-hq-stk", "MQ==");
                 headers.add("Authorization", "Bearer " + settings.bearer_id);
                 headers.add("x-hq-client", "Android/1.3.0");
                 websocket_client client(client_config);
@@ -809,7 +818,7 @@ int main(int argc, char** argv){
                     attroff(COLOR_PAIR(5));
 
                     // Start thread.
-                    wsThreads.push_back(std::thread([&client](){
+                    wsThreads.push_back(std::thread([&client, socketUrl](){
                         try {
                             while(true){
                                 client.receive().then([](websocket_incoming_message msg){
@@ -858,7 +867,7 @@ int main(int argc, char** argv){
                         } catch(std::exception& e){
                             bool display_error = true;
                             std::string err_msg(e.what());
-                            if(err_msg.find("close") !== std::string::npos){
+                            if(err_msg.find("close") != std::string::npos){
                                 try {
                                     display_error = false;
                                     client.connect(socketUrl).wait();
