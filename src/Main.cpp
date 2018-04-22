@@ -608,6 +608,7 @@ void rightWriteText(int row, const char* fmt, Args&&... args){
 }
 
 std::vector<std::string> explode(std::string s, std::string a){
+    // TODO: fix broken explode() function
     size_t last = 0, next;
     std::vector<std::string> ret;
     while((next = s.find(a, last)) != EOF){
@@ -625,6 +626,7 @@ void displayQuestion(Question q){
     std::string rep = ss.str();
     for(auto line : explode(rep, "\n")){
         if(line.find("\n") != std::string::npos){
+            // TODO: fix broken explode() function
             std::cout << "|" + line + "|";
             throw std::logic_error("");
         }
