@@ -82,6 +82,33 @@ struct Question {
         }
         return outs << std::endl;
     }
+
+    std::string getPlainRepresentation(){
+        Question& q = *this;
+        std::stringstream outs;
+        outs << q.question << std::endl << std::endl;
+        const bool haveScores = !q.scores.empty();
+        double highestScore = -1e99;
+        unsigned int highestIdx = 0;
+        if(haveScores){
+            for(unsigned int i = 0; i < q.options.size(); i++){
+                if(q.scores[i] > highestScore){
+                    highestScore = q.scores[i];
+                    highestIdx = i;
+                }
+            }
+        }
+        for(unsigned int i = 0; i < q.options.size(); i++){
+            outs << (i + 1) << ". " << q.options[i];
+            if(haveScores){
+                outs << " [score: " << q.scores[i];
+                outs << "]";
+            }
+            outs << std::endl;
+        }
+        outs << std::endl;
+        return outs.str();
+    }
 };
 
 std::string stripString(std::string s){
@@ -553,13 +580,17 @@ json retrieveShowStatus(){
     }
     curl_easy_cleanup(curl);
     curl_slist_free_all(chunk);
-    return json::parse(out.str());
+    try {
+        return json::parse(out.str());
+    } catch(nlohmann::detail::type_error& e){
+        return json::object();
+    }
 }
 
 template<class... Args>
 void centerWriteText(int row, const char* fmt, Args&&... args){
     int neededLen = snprintf(NULL, 0, fmt, std::forward<Args>(args)...);
-    char* buf = new char[neededLen + 1]; 
+    char* buf = new char[neededLen + 1];
     sprintf(buf, fmt, std::forward<Args>(args)...);
     std::string formatted(buf);
     delete[] buf;
@@ -569,11 +600,40 @@ void centerWriteText(int row, const char* fmt, Args&&... args){
 template<class... Args>
 void rightWriteText(int row, const char* fmt, Args&&... args){
     int neededLen = snprintf(NULL, 0, fmt, std::forward<Args>(args)...);
-    char* buf = new char[neededLen + 1]; 
+    char* buf = new char[neededLen + 1];
     sprintf(buf, fmt, std::forward<Args>(args)...);
     std::string formatted(buf);
     delete[] buf;
     mvprintw(row, numCols - formatted.length(), formatted.c_str());
+}
+
+std::vector<std::string> explode(std::string s, std::string a){
+    size_t last = 0, next;
+    std::vector<std::string> ret;
+    while((next = s.find(a, last)) != EOF){
+        ret.push_back(s.substr(last, next - 1));
+        last = next + 1;
+    }
+    ret.push_back(s.substr(last));
+    return ret;
+}
+
+void displayQuestion(Question q){
+    int rowOn = numRows / 2;
+    std::stringstream ss;
+    ss << q.getPlainRepresentation();
+    std::string rep = ss.str();
+    for(auto line : explode(rep, "\n")){
+        if(line.find("\n") != std::string::npos){
+            std::cout << "|" + line + "|";
+            throw std::logic_error("");
+        }
+        centerWriteText(rowOn, "%s", std::string(" ", numCols).c_str()); // clear line
+        centerWriteText(rowOn, "%s", line.c_str()); // write content
+        ++rowOn;
+    }
+    move(numRows - 1, 0);
+    refresh();
 }
 
 void displayAndSolveQuestion(json j){
@@ -587,19 +647,14 @@ void displayAndSolveQuestion(json j){
         }
 
         // Display parsed question
-        move(numRows / 2, 0);
-        refresh();
-        std::cout << q;
+        displayQuestion(q);
 
         // Predict question answer
-        predictQuestionAnswer(q, /*verbose=*/false);
+        unsigned int idx = predictQuestionAnswer(q, /*verbose=*/true);
 
         // Display question answer
-        move(numRows - 1, 0);
-        for(int i = 0; i < numRows; i++){
-            puts(""); // TODO: better way to clear just affected area (subwindow?)
-        }
-        std::cout << q;
+        displayQuestion(q);
+        centerWriteText(numRows - 2, "(Answer is option #%u)", idx + 1);
         refresh();
     } else if(type == "questionSummary"){
         // ...
@@ -720,9 +775,9 @@ int main(int argc, char** argv){
         }
     } else if(mainArg == "--live"){
         if(settings.user_id.empty() || settings.bearer_id.empty()){
-            std::cerr << "Cannot use live mode if credentials are not provided." << std::endl;
             endwin();
             api->End();
+            std::cerr << Colors::FAIL << "Cannot use live mode if credentials are not provided." << std::endl << Colors::ENDC;
             return 1;
         }
         printw("Initialized %dx%d window.", numRows, numCols);
@@ -751,11 +806,21 @@ int main(int argc, char** argv){
 
             // Retrieve status anew.
             json j = retrieveShowStatus();
+            bool isShowActive;
+            try {
+                isShowActive = j.at("active").get<bool>();
+            } catch(json::out_of_range& e){
+                endwin();
+                api->End();
+                std::cerr << Colors::FAIL << "Invalid user or bearer ID provided." << std::endl << Colors::ENDC;
+                return 1;
+            }
+
             // std::cout << j.dump() << std::endl;
             // TODO: A_STANDOUT suggested answer
 
             // Check if show is live.
-            if(j["active"].get<bool>() == false){
+            if(!isShowActive){
                 // Display status header.
                 attron(A_UNDERLINE);
                 attron(COLOR_PAIR(1));
@@ -808,9 +873,9 @@ int main(int argc, char** argv){
                 auto& headers = client_config.headers();
                 headers.add("Authorization", "Bearer " + settings.bearer_id);
                 headers.add("x-hq-client", "Android/1.3.0");
-                websocket_client client(client_config);
+                websocket_client* client = new websocket_client(client_config);
                 try {
-                    client.connect(socketUrl).wait();
+                    client->connect(socketUrl).wait();
 
                     // Display success.
                     attron(COLOR_PAIR(5));
@@ -818,12 +883,12 @@ int main(int argc, char** argv){
                     attroff(COLOR_PAIR(5));
 
                     // Start thread.
-                    wsThreads.push_back(std::thread([&client, socketUrl](){
+                    wsThreads.push_back(std::thread([&client, socketUrl, &client_config](){
                         try {
                             while(true){
-                                client.receive().then([](websocket_incoming_message msg){
+                                client->receive().then([](websocket_incoming_message msg){
                                     return msg.extract_string();
-                                }).then([&client](std::string msg){
+                                }).then([](std::string msg){
                                     // Attempt to parse message.
                                     json parsed;
                                     try {
@@ -851,15 +916,8 @@ int main(int argc, char** argv){
                                         rightWriteText(1, "Question finished.");
                                         attroff(COLOR_PAIR(2));
                                     } else if(type == "broadcastStats"){
-                                        rightWriteText(2, "Player Count: %s", parsed["viewerCounts"]["playing"].get<std::string>().c_str());
-                                        rightWriteText(3, "Spectator Count: %s", parsed["viewerCounts"]["watching"].get<std::string>().c_str());
-                                    } else if(type == "broadcastEnded"){
-                                        attron(COLOR_PAIR(4));
-                                        attron(A_BLINK);
-                                        rightWriteText(0, "Broadcast has ended.");
-                                        attroff(A_BLINK);
-                                        attroff(COLOR_PAIR(4));
-                                        client.close();
+                                        rightWriteText(2, "Player Count: %7d", parsed["viewerCounts"]["playing"].get<int>());
+                                        rightWriteText(3, "Spectator Count: %7d", parsed["viewerCounts"]["watching"].get<int>());
                                     }
                                     refresh();
                                 }).wait();
@@ -867,10 +925,10 @@ int main(int argc, char** argv){
                         } catch(std::exception& e){
                             bool display_error = true;
                             std::string err_msg(e.what());
-                            if(err_msg.find("close") != std::string::npos){
+                            if(err_msg.find("close") != std::string::npos || true){
                                 try {
                                     display_error = false;
-                                    client.connect(socketUrl).wait();
+                                    client = new websocket_client(client_config);
                                 } catch(std::exception& e){
                                     err_msg = std::string(e.what());
                                     display_error = true;
@@ -916,6 +974,9 @@ int main(int argc, char** argv){
             std::cerr << "Could not recognize question.\n";
             return 1;
         }
+
+        // Display question.
+        displayQuestion(q);
 
         // Predict question answer.
         predictQuestionAnswer(q);
